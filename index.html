@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HMCLOCK Control - Gửi ảnh</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; background:#f4f4f6; color:#1a1a1a; }
+  h1 { font-size: 20px; }
+  .card { background:#fff; border-radius:12px; padding:16px; margin-bottom:14px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  button { background:#2563eb; color:#fff; border:none; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; margin:4px 0; }
+  button:disabled { background:#9ca3af; cursor:not-allowed; }
+  button.secondary { background:#6b7280; }
+  select, input[type=file] { padding:8px; border:1px solid #d1d5db; border-radius:8px; width:100%; box-sizing:border-box; margin:6px 0; }
+  label { font-size:14px; font-weight:600; display:block; margin-top:8px; }
+  canvas { border:1px solid #d1d5db; image-rendering:pixelated; margin:8px 0; background:#fff; }
+  #log { background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:10px; border-radius:8px; height:160px; overflow-y:auto; white-space:pre-wrap; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+
+<h1>HMCLOCK Control</h1>
+
+<div class="card">
+  <button id="connectBtn" onclick="toggleConnect()">Kết nối Bluetooth</button>
+  <span id="status">Chưa kết nối</span>
+</div>
+
+<div class="card">
+  <label>Chức năng thời gian</label>
+  <button onclick="setTime()">Đồng bộ giờ</button>
+  <button class="secondary" onclick="toggle2412()">Đổi 12/24h</button>
+</div>
+
+<div class="card">
+  <label for="screenSize">Kích thước màn hình thẻ</label>
+  <select id="screenSize" onchange="setupCanvas()">
+    <option value="212x104">2.13" — 212 x 104</option>
+    <option value="250x122">2.13" — 250 x 122</option>
+    <option value="296x128">2.9" — 296 x 128</option>
+  </select>
+
+  <label for="imgFile">Chọn ảnh</label>
+  <input type="file" id="imgFile" accept="image/*" onchange="loadImage(event)">
+
+  <label for="dither">Kiểu xử lý ảnh</label>
+  <select id="dither" onchange="renderPreview()">
+    <option value="floyd">Floyd–Steinberg (dithering, đẹp)</option>
+    <option value="threshold">Threshold (ngưỡng cứng)</option>
+  </select>
+
+  <label>Ngưỡng sáng/tối: <span id="thVal">128</span></label>
+  <input type="range" id="threshold" min="0" max="255" value="128" style="width:100%" oninput="thVal.textContent=this.value; renderPreview()">
+
+  <div class="row">
+    <label style="margin:0"><input type="checkbox" id="invert" onchange="renderPreview()"> Đảo màu</label>
+  </div>
+
+  <div>Xem trước (đúng như trên màn e-ink):</div>
+  <canvas id="canvas"></canvas>
+
+  <button id="sendBtn" onclick="sendImage()" disabled>Gửi ảnh lên thẻ</button>
+</div>
+
+<div class="card">
+  <label>Log</label>
+  <div id="log"></div>
+</div>
+
+<script>
+// ====== BLE: giao thức HMCLOCK (service 0xFF00, char 0xFF01) ======
+const SVC = 0xff00;
+const CHAR_LONG = 0xff01;   // kênh chính: set time, ảnh
+let device, server, svc, chLong;
+
+function log(s){ const l=document.getElementById('log'); l.textContent += s+"\n"; l.scrollTop=l.scrollHeight; }
+function delay(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function toggleConnect(){
+  if(device && device.gatt.connected){ device.gatt.disconnect(); return; }
+  try{
+    log("Đang quét thiết bị...");
+    device = await navigator.bluetooth.requestDevice({
+      filters:[{ namePrefix:'DLG-CLOCK' }],
+      optionalServices:[ SVC ]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnect);
+    server = await device.gatt.connect();
+    log("> Đã kết nối GATT");
+    svc = await server.getPrimaryService(SVC);
+    chLong = await svc.getCharacteristic(CHAR_LONG);
+    log("> Tìm thấy service 0xFF00 / char 0xFF01");
+    document.getElementById('status').textContent = "Đã kết nối: "+device.name;
+    document.getElementById('connectBtn').textContent = "Ngắt kết nối";
+    document.getElementById('sendBtn').disabled = false;
+  }catch(e){ log("Lỗi: "+e); }
+}
+function onDisconnect(){
+  log("Đã ngắt kết nối");
+  document.getElementById('status').textContent = "Chưa kết nối";
+  document.getElementById('connectBtn').textContent = "Kết nối Bluetooth";
+  document.getElementById('sendBtn').disabled = true;
+}
+
+// ghi 1 mảng byte vào char 0xFF01
+async function writeLong(bytes){
+  if(!chLong){ log("Chưa kết nối!"); return; }
+  await chLong.writeValueWithResponse(new Uint8Array(bytes));
+}
+
+// ====== SET TIME (lệnh 0x91 của HMCLOCK) ======
+// Format HMCLOCK: 91 + year(2,LE) + month + day + hour + min + sec + wday + lyear + lmonth + ldate
+async function setTime(){
+  const d = new Date();
+  const y = d.getFullYear();
+  // Lịch âm: HMCLOCK tự tính, gửi 0 cũng được (firmware có get_holiday)
+  const pkt = [0x91, y&0xff, (y>>8)&0xff, d.getMonth()+1, d.getDate(),
+               d.getHours(), d.getMinutes(), d.getSeconds(), d.getDay(),
+               0, 0, 1];
+  await writeLong(pkt);
+  log("Đã gửi giờ: "+d.toLocaleString());
+}
+async function toggle2412(){ await writeLong([0x90]); log("Đã đổi 12/24h"); }
+
+// ====== ẢNH ======
+let curW=212, curH=104;
+
+function setupCanvas(){
+  const [w,h] = document.getElementById('screenSize').value.split('x').map(Number);
+  curW=w; curH=h;
+  const c=document.getElementById('canvas');
+  c.width=w; c.height=h;
+  c.style.width=(w*2)+"px"; c.style.height=(h*2)+"px";
+  const ctx=c.getContext('2d'); ctx.fillStyle='white'; ctx.fillRect(0,0,w,h);
+}
+
+let srcImage=null;
+function loadImage(ev){
+  const f=ev.target.files[0]; if(!f) return;
+  const img=new Image();
+  img.onload=()=>{ srcImage=img; renderPreview(); };
+  img.src=URL.createObjectURL(f);
+}
+
+function renderPreview(){
+  if(!srcImage) return;
+  const c=document.getElementById('canvas'), ctx=c.getContext('2d');
+  ctx.fillStyle='white'; ctx.fillRect(0,0,curW,curH);
+  // fit ảnh giữ tỉ lệ
+  const r=Math.min(curW/srcImage.width, curH/srcImage.height);
+  const nw=srcImage.width*r, nh=srcImage.height*r;
+  ctx.drawImage(srcImage,(curW-nw)/2,(curH-nh)/2,nw,nh);
+
+  // grayscale
+  const imgd=ctx.getImageData(0,0,curW,curH);
+  const p=imgd.data;
+  const gray=new Float32Array(curW*curH);
+  for(let i=0;i<curW*curH;i++){
+    gray[i]=0.299*p[i*4]+0.587*p[i*4+1]+0.114*p[i*4+2];
+  }
+  const mode=document.getElementById('dither').value;
+  const th=+document.getElementById('threshold').value;
+  const inv=document.getElementById('invert').checked;
+
+  if(mode==='floyd'){
+    for(let y=0;y<curH;y++) for(let x=0;x<curW;x++){
+      const i=y*curW+x; const old=gray[i]; const nw2=old<th?0:255;
+      gray[i]=nw2; const err=old-nw2;
+      if(x+1<curW) gray[i+1]+=err*7/16;
+      if(y+1<curH){
+        if(x>0) gray[i+curW-1]+=err*3/16;
+        gray[i+curW]+=err*5/16;
+        if(x+1<curW) gray[i+curW+1]+=err*1/16;
+      }
+    }
+  }else{
+    for(let i=0;i<curW*curH;i++) gray[i]=gray[i]<th?0:255;
+  }
+  // vẽ lại + lưu bit (1=trắng,0=đen theo canvas2bytes_bw)
+  for(let i=0;i<curW*curH;i++){
+    let v=gray[i]<128?0:255;
+    if(inv) v=255-v;
+    p[i*4]=p[i*4+1]=p[i*4+2]=v; p[i*4+3]=255;
+  }
+  ctx.putImageData(imgd,0,0);
+}
+
+// đóng gói giống canvas2bytes_bw: cột từ phải sang trái, mỗi cột trên->dưới, MSB trước
+function canvasToBytes(){
+  const c=document.getElementById('canvas'), ctx=c.getContext('2d');
+  const d=ctx.getImageData(0,0,curW,curH).data;
+  const arr=[]; let buf=[];
+  for(let x=curW-1;x>=0;x--){
+    for(let y=0;y<curH;y++){
+      const idx=(curW*4*y)+x*4;
+      const white = d[idx]>0 && d[idx+1]>0 && d[idx+2]>0 ? 1:0;
+      buf.push(white);
+      if(buf.length===8){ arr.push(parseInt(buf.join(''),2)); buf=[]; }
+    }
+  }
+  if(buf.length>0){ while(buf.length<8) buf.push(1); arr.push(parseInt(buf.join(''),2)); }
+  return arr;
+}
+
+// gửi ảnh: chunk 156 byte data, lệnh 0x80 + offset(2), rồi 0x81 render
+async function sendImage(){
+  if(!chLong){ log("Chưa kết nối!"); return; }
+  const bytes=canvasToBytes();
+  log("Bắt đầu gửi ảnh, tổng "+bytes.length+" byte");
+  const CHUNK=156;
+  for(let off=0; off<bytes.length; off+=CHUNK){
+    const part=bytes.slice(off, off+CHUNK);
+    const pkt=[0x80, (off>>8)&0xff, off&0xff, ...part];
+    await writeLong(pkt);
+    log("  gửi offset "+off+" ("+part.length+" byte)");
+    await delay(30);
+  }
+  await delay(100);
+  await writeLong([0x81]);   // render
+  log("Đã gửi lệnh vẽ. Chờ màn hình cập nhật...");
+}
+
+setupCanvas();
+</script>
+</body>
+</html>
