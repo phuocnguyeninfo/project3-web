@@ -34,6 +34,12 @@
 </div>
 
 <div class="card">
+  <label>Chuyển màn hình</label>
+  <button onclick="showClock()">Đồng hồ</button>
+  <button onclick="showCalendar()">Lịch tháng</button>
+</div>
+
+<div class="card">
   <label for="screenSize">Kích thước màn hình thẻ</label>
   <select id="screenSize" onchange="setupCanvas()">
     <option value="212x104">2.13" — 212 x 104</option>
@@ -122,6 +128,10 @@ async function setTime(){
   log("Đã gửi giờ: "+d.toLocaleString());
 }
 async function toggle2412(){ await writeLong([0x90]); log("Đã đổi 12/24h"); }
+
+// ====== CHUYỂN MÀN (lệnh 0x93) ======
+async function showClock(){ await writeLong([0x93, 0x00]); log("Đã chuyển sang màn Đồng hồ"); }
+async function showCalendar(){ await writeLong([0x93, 0x01]); log("Đã chuyển sang màn Lịch tháng"); }
 
 // ====== ẢNH ======
 let curW=212, curH=104;
