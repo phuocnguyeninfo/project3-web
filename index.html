@@ -120,12 +120,31 @@ async function writeLong(bytes){
 async function setTime(){
   const d = new Date();
   const y = d.getFullYear();
-  // Lịch âm: HMCLOCK tự tính, gửi 0 cũng được (firmware có get_holiday)
+
+  // Lịch âm: firmware KHÔNG tự tính — nó chỉ lưu lyear/lmonth/ldate rồi tăng
+  // dần mỗi ngày (ldate_inc trong user_custs1_impl.c). Gửi 0,0,1 cố định như
+  // trước đây làm nó bị ép về "mùng 1 tháng Giêng, năm chỉ số 0 = 2020" mỗi
+  // lần đồng bộ giờ -> lịch âm hiển thị sai. Phải tính đúng ngày âm hiện tại.
+  const locale_str = d.toLocaleDateString('zh-CN-u-ca-chinese',{month:'numeric',day:'numeric'});
+  let l_month = locale_str.startsWith('闰') ? 128 : 0;
+  const ls = l_month ? locale_str.slice(1) : locale_str;
+  const [l_month_num, l_day] = ls.split('-').map(Number);
+  l_month += l_month_num;
+
+  // Không dùng toLocaleDateString({year:'numeric'}) cho lịch 'chinese': field
+  // đó trả về năm theo chu kỳ Can-Chi 60 năm (1-60), không phải năm dương
+  // thật, khiến "lyear - 2020" lệch cực lớn và firmware tra bảng
+  // lunar_year_info[] ngoài phạm vi (32 phần tử, ứng với 2020-2051).
+  // Dùng formatToParts() lấy field 'relatedYear' (năm dương liên quan).
+  const ryParts = new Intl.DateTimeFormat('zh-CN-u-ca-chinese', {year:'numeric'}).formatToParts(d);
+  const relatedYear = ryParts.find(p => p.type === 'relatedYear');
+  const l_year = relatedYear ? parseInt(relatedYear.value) : y;
+
   const pkt = [0x91, y&0xff, (y>>8)&0xff, d.getMonth()+1, d.getDate(),
                d.getHours(), d.getMinutes(), d.getSeconds(), d.getDay(),
-               0, 0, 1];
+               l_year - 2020, l_month - 1, l_day];
   await writeLong(pkt);
-  log("Đã gửi giờ: "+d.toLocaleString());
+  log("Đã gửi giờ: "+d.toLocaleString()+" — âm lịch: "+l_day+"/"+(l_month&0x7f)+(l_month&128?" (nhuận)":"")+"/"+l_year);
 }
 async function toggle2412(){ await writeLong([0x90]); log("Đã đổi 12/24h"); }
 
@@ -213,20 +232,23 @@ function canvasToBytes(){
   return arr;
 }
 
-// gửi ảnh: chunk 156 byte data, lệnh 0x80 + offset(2), rồi 0x81 render
+// gửi ảnh: chunk nhỏ (an toàn với MTU mặc định 23 byte), lệnh 0x80 + offset(2), rồi 0x81 render
 async function sendImage(){
   if(!chLong){ log("Chưa kết nối!"); return; }
   const bytes=canvasToBytes();
   log("Bắt đầu gửi ảnh, tổng "+bytes.length+" byte");
-  const CHUNK=156;
+  // Gói 0x80 = 1 byte lệnh + 2 byte offset + data. Để chắc chắn không vượt MTU
+  // mặc định (23 byte, tức 20 byte payload) dù thiết bị/trình duyệt không
+  // thương lượng MTU lớn hơn, giới hạn data mỗi gói còn 16 byte (gói tổng 19 byte).
+  const CHUNK=16;
   for(let off=0; off<bytes.length; off+=CHUNK){
     const part=bytes.slice(off, off+CHUNK);
     const pkt=[0x80, (off>>8)&0xff, off&0xff, ...part];
     await writeLong(pkt);
-    log("  gửi offset "+off+" ("+part.length+" byte)");
-    await delay(30);
+    if(off%160===0) log("  gửi offset "+off+"/"+bytes.length);
+    await delay(15);
   }
-  await delay(100);
+  await delay(150);
   await writeLong([0x81]);   // render
   log("Đã gửi lệnh vẽ. Chờ màn hình cập nhật...");
 }
