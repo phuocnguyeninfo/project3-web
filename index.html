@@ -102,7 +102,7 @@ async function toggleConnect(){
   try{
     log("Đang quét thiết bị...");
     device = await navigator.bluetooth.requestDevice({
-      filters:[{ namePrefix:'DNG-CLOCK' }],
+      filters:[{ namePrefix:'CREAX-INK' }],
       optionalServices:[ SVC ]
     });
     device.addEventListener('gattserverdisconnected', onDisconnect);
