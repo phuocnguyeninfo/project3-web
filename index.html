@@ -16,6 +16,10 @@
   canvas { border:1px solid #d1d5db; image-rendering:pixelated; margin:8px 0; background:#fff; }
   #log { background:#111; color:#0f0; font-family:monospace; font-size:12px; padding:10px; border-radius:8px; height:160px; overflow-y:auto; white-space:pre-wrap; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .hidden { display:none; }
+  .progress-track { background:#e5e7eb; border-radius:8px; overflow:hidden; height:14px; margin-top:8px; }
+  .progress-bar { background:#2563eb; height:100%; width:0%; transition:width .15s; }
+  .progress-text { font-size:12px; margin-top:4px; color:#4b5563; }
 </style>
 </head>
 <body>
@@ -37,6 +41,16 @@
   <label>Chuyển màn hình</label>
   <button onclick="showClock()">Đồng hồ</button>
   <button onclick="showCalendar()">Lịch tháng</button>
+</div>
+
+<div class="card">
+  <label for="firmFile">Cập nhật firmware (.bin)</label>
+  <input type="file" id="firmFile" accept=".bin">
+  <button id="firmBtn" onclick="updateFirmware()">Nạp firmware qua Bluetooth</button>
+  <div id="firmProgressWrap" class="hidden">
+    <div class="progress-track"><div id="firmProgressBar" class="progress-bar"></div></div>
+    <div id="firmProgressText" class="progress-text">0%</div>
+  </div>
 </div>
 
 <div class="card">
@@ -147,6 +161,119 @@ async function setTime(){
   log("Đã gửi giờ: "+d.toLocaleString()+" — âm lịch: "+l_day+"/"+(l_month&0x7f)+(l_month&128?" (nhuận)":"")+"/"+l_year);
 }
 async function toggle2412(){ await writeLong([0x90]); log("Đã đổi 12/24h"); }
+
+// ====== CẬP NHẬT FIRMWARE QUA BLUETOOTH (lệnh 0xA0-0xA4 của HMCLOCK) ======
+// Giao thức giống hệt webApp.html: 0xA0 báo dung lượng file, sau đó lặp gói
+// 256 byte gồm 2 lệnh 0xA2 (nội dung firmware) + 0xA3 (nội dung), gói đầu
+// tiên kèm header (magic, size, CRC32, version) ở offset 8, kết thúc bằng
+// 0xA4. Firmware xác thực bằng CRC32 nên không được thay đổi thứ tự byte.
+
+// Bảng CRC32 chuẩn (IEEE 802.3, giống thư viện crc-32 mà webApp.html dùng
+// qua CDN) — cài đặt sẵn ở đây để index.html không phụ thuộc mạng ngoài.
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(buf){
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) crc = CRC32_TABLE[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+// Tìm nhãn phiên bản (8 byte magic) được build tool chèn vào file .bin
+function findPattern(target, patten){
+  for (let i = 0; i <= target.length - patten.length; i++){
+    let match = true;
+    for (let j = 0; j < patten.length; j++){
+      if (target[i+j] !== patten[j]) { match = false; break; }
+    }
+    if (match) return i;
+  }
+  return -1;
+}
+
+async function updateFirmware(){
+  if(!chLong){ log("Chưa kết nối!"); return; }
+
+  const file = document.getElementById('firmFile').files[0];
+  if(!file){ log("Chưa chọn file firmware (.bin)!"); return; }
+
+  const firmBtn = document.getElementById('firmBtn');
+  const progressWrap = document.getElementById('firmProgressWrap');
+  const progressBar = document.getElementById('firmProgressBar');
+  const progressText = document.getElementById('firmProgressText');
+
+  firmBtn.disabled = true;
+  progressWrap.classList.remove('hidden');
+
+  try{
+    const firm_buf = new Uint8Array(await file.arrayBuffer());
+    const firm_size = firm_buf.length;
+
+    const firm_magic = new Uint8Array([0x79, 0x13, 0xa5, 0xf9, 0x86, 0xec, 0x5a, 0x06]);
+    const pos = findPattern(firm_buf, firm_magic);
+    if(pos === -1){
+      log("File firmware không hợp lệ: không tìm thấy nhãn phiên bản!");
+      return;
+    }
+
+    const firm_ver = firm_buf[pos+9]*256 + firm_buf[pos+8];
+    const firm_crc = crc32(firm_buf);
+    log("Firmware v"+firm_ver+", size="+firm_size+" byte, CRC32="+firm_crc.toString(16));
+
+    let buf = new Uint8Array(136);
+    let view = new DataView(buf.buffer);
+    buf[0] = 0xa0;
+    view.setUint16(2, firm_size, true);
+    await writeLong(buf);
+
+    let sent = 0;
+    const totalSize = firm_size + 64;
+
+    for(let i = 0; i < totalSize; i += 256){
+      buf.fill(0xff);
+      if(i === 0){
+        view.setUint32(8, 0x00aa5170, true);
+        view.setUint32(12, firm_size, true);
+        view.setUint32(16, firm_crc, true);
+        view.setUint32(36, 0xa50f0000 + firm_ver, true);
+        buf[40] = 0;
+        buf[0] = 0xa2;
+        buf.set(firm_buf.slice(sent, sent+64), 72);
+        await writeLong(buf);
+        sent += 64;
+      }else{
+        buf[0] = 0xa2;
+        buf.set(firm_buf.slice(sent, sent+128), 8);
+        await writeLong(buf);
+        sent += 128;
+      }
+      buf[0] = 0xa3;
+      buf.set(firm_buf.slice(sent, sent+128), 8);
+      await writeLong(buf);
+      sent += 128;
+
+      const progress = Math.min(Math.round(100*sent/totalSize), 100);
+      progressBar.style.width = progress+"%";
+      progressText.textContent = progress+"%";
+    }
+
+    buf[0] = 0xa4;
+    buf.fill(0, 1, 4);
+    await writeLong(buf);
+    log("Nạp firmware xong — thiết bị sẽ tự khởi động lại.");
+  }catch(err){
+    log("Nạp firmware lỗi (có thể do mất kết nối Bluetooth): "+err);
+  }finally{
+    firmBtn.disabled = false;
+    progressWrap.classList.add('hidden');
+  }
+}
 
 // ====== CHUYỂN MÀN (lệnh 0x93) ======
 async function showClock(){ await writeLong([0x93, 0x00]); log("Đã chuyển sang màn Đồng hồ"); }
